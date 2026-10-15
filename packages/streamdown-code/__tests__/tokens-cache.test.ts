@@ -4,6 +4,8 @@ import { createCodePlugin, type HighlightResult } from "../index";
 
 // Count tokenizations so the tests can tell a cache hit from a miss
 let tokenizeCalls = 0;
+// Count highlighter creations, each of which loads a language and themes
+let createHighlighterCalls = 0;
 // Lets a test make the next tokenization fail
 let failNextTokenize = false;
 
@@ -14,6 +16,7 @@ vi.mock("shiki", async (importOriginal) => {
     createHighlighter: async (
       ...args: Parameters<typeof shiki.createHighlighter>
     ) => {
+      createHighlighterCalls++;
       const highlighter = await shiki.createHighlighter(...args);
       const codeToTokens = highlighter.codeToTokens.bind(highlighter);
       highlighter.codeToTokens = (code, options) => {
@@ -293,5 +296,60 @@ describe("tokens cache", () => {
     // own callback
     expect(text(await highlight(code))).toBe(code);
     expect(callback).not.toHaveBeenCalled();
+  });
+});
+
+describe("getCachedResult", () => {
+  it("returns null for code it has not highlighted, and starts no work", async () => {
+    const code = block("read-before-highlight");
+    const before = {
+      created: createHighlighterCalls,
+      tokenized: tokenizeCalls,
+    };
+
+    // Languages no other test has loaded, so a lookup that started work
+    // would have to create a highlighter for them
+    for (const language of ["elixir", "haskell", "not-a-language", ""]) {
+      expect(plugin.getCachedResult(request(code, false, language))).toBeNull();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect({
+      created: createHighlighterCalls,
+      tokenized: tokenizeCalls,
+    }).toEqual(before);
+  });
+
+  it("returns the result of a finished block", async () => {
+    const code = block("read-finished");
+    const result = await highlight(code);
+
+    expect(plugin.getCachedResult(request(code))).toBe(result);
+  });
+
+  it("does not keep a result from eviction by reading it", async () => {
+    const language = "text";
+    const codes = Array.from({ length: 5000 }, (_, i) => `peeked ${i}`);
+    for (const code of codes) {
+      await highlight(code, false, language);
+    }
+    expect(
+      plugin.getCachedResult(request(codes[0], false, language))
+    ).not.toBeNull();
+
+    await highlight("peeked new", false, language);
+
+    expect(
+      plugin.getCachedResult(request(codes[0], false, language))
+    ).toBeNull();
+    expect(
+      plugin.getCachedResult(request(codes[1], false, language))
+    ).not.toBeNull();
+  });
+
+  it("returns null for code only highlighted while it streamed", async () => {
+    const code = block("read-streaming");
+    await highlight(code, true);
+
+    expect(plugin.getCachedResult(request(code, true))).toBeNull();
   });
 });

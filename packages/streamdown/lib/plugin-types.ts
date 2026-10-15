@@ -59,6 +59,14 @@ export interface HighlightOptions {
  */
 export interface CodeHighlighterPlugin {
   /**
+   * Return the result `highlight` would return right away, without starting
+   * a highlight or changing the plugin's state (such as cache recency).
+   * Streamdown calls it while rendering, including renders React throws
+   * away. In client renders after hydration, a block whose result the plugin
+   * already has is then rendered highlighted in its first commit.
+   */
+  getCachedResult?(options: HighlightOptions): HighlightResult | null;
+  /**
    * Get list of supported languages
    */
   getSupportedLanguages(): BundledLanguage[];

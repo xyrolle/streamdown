@@ -43,6 +43,12 @@ export interface HighlightOptions {
  */
 export interface CodeHighlighterPlugin {
   /**
+   * Return the result `highlight` would return right away, without starting
+   * a highlight or making the result recently used: the cached result of a
+   * finished block that has not been evicted, or null
+   */
+  getCachedResult?: (options: HighlightOptions) => HighlightResult | null;
+  /**
    * Get list of supported languages
    */
   getSupportedLanguages: () => BundledLanguage[];
@@ -146,6 +152,11 @@ const getCachedTokens = (key: string): TokensResult | undefined => {
   }
   return entry?.result;
 };
+
+// Unlike getCachedTokens, reading does not make the result recently used:
+// only results that highlight returns decide what is evicted
+const peekCachedTokens = (key: string): TokensResult | undefined =>
+  tokensCache.get(key)?.result;
 
 const removeCachedTokens = (key: string): void => {
   const entry = tokensCache.get(key);
@@ -310,12 +321,26 @@ const getHighlighter = (
   return highlighterPromise;
 };
 
+const getThemeNames = (themes: [ThemeInput, ThemeInput]): [string, string] => [
+  getThemeName(themes[0]),
+  getThemeName(themes[1]),
+];
+
+// Unsupported languages (e.g. a truncated identifier) highlight as plain text
+const getSafeLanguage = (
+  resolvedLanguage: string
+): BundledLanguage | SpecialLanguage =>
+  languageNames.has(resolvedLanguage as BundledLanguage)
+    ? (resolvedLanguage as BundledLanguage)
+    : "text";
+
 /**
  * Create a code plugin with optional configuration
  */
 export function createCodePlugin(
   options: CodePluginOptions = {}
-): CodeHighlighterPlugin {
+): CodeHighlighterPlugin &
+  Required<Pick<CodeHighlighterPlugin, "getCachedResult">> {
   const defaultThemes: [ThemeInput, ThemeInput] = options.themes ?? [
     "github-light",
     "github-dark",
@@ -338,22 +363,22 @@ export function createCodePlugin(
       return defaultThemes;
     },
 
+    getCachedResult({ code, language, themes }: HighlightOptions) {
+      const safeLanguage = getSafeLanguage(normalizeLanguage(language));
+      return (
+        peekCachedTokens(
+          getTokensCacheKey(code, safeLanguage, getThemeNames(themes))
+        ) ?? null
+      );
+    },
+
     highlight(
       { code, language, themes, isIncomplete = false }: HighlightOptions,
       callback?: (result: HighlightResult) => void
     ): HighlightResult | null {
       const resolvedLanguage = normalizeLanguage(language);
-      const themeNames: [string, string] = [
-        getThemeName(themes[0]),
-        getThemeName(themes[1]),
-      ];
-
-      // Resolve language to 'text' if not supported (e.g. truncated identifier)
-      const safeLanguage: BundledLanguage | SpecialLanguage = languageNames.has(
-        resolvedLanguage as BundledLanguage
-      )
-        ? (resolvedLanguage as BundledLanguage)
-        : "text";
+      const themeNames = getThemeNames(themes);
+      const safeLanguage = getSafeLanguage(resolvedLanguage);
       const tokensCacheKey = getTokensCacheKey(code, safeLanguage, themeNames);
 
       const cached = getCachedTokens(tokensCacheKey);
