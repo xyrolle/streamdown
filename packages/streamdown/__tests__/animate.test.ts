@@ -787,3 +787,98 @@ describe("animate plugin", () => {
     });
   });
 });
+
+describe("text that changed between renders", () => {
+  const durationsOf = (html: string) =>
+    Array.from(
+      html.matchAll(/<span[^>]*--sd-duration:(\d+)ms[^>]*>([^<]*)<\/span>/g),
+      (match) => `${match[2].trim()}=${match[1]}`
+    );
+
+  it("fades text that replaces the committed text", async () => {
+    const plugin = createAnimatePlugin();
+    await processHtml("<p>Alpha beta gamma delta epsilon</p>", plugin);
+    plugin.commit();
+
+    const result = await processHtml("<p>Omega psi chi</p>", plugin);
+
+    expect(durationsOf(result)).toEqual(["Omega=150", "psi=150", "chi=150"]);
+  });
+
+  it("keeps the unchanged start settled and fades what replaced the rest", async () => {
+    const plugin = createAnimatePlugin();
+    await processHtml("<p>Alpha beta gamma delta</p>", plugin);
+    plugin.commit();
+
+    const result = await processHtml("<p>Alpha beta omega</p>", plugin);
+
+    expect(durationsOf(result)).toEqual(["Alpha=0", "beta=0", "omega=150"]);
+  });
+
+  it("still treats a word that grew as already shown", async () => {
+    const plugin = createAnimatePlugin();
+    await processHtml("<p>Hello wor</p>", plugin);
+    plugin.commit();
+
+    const result = await processHtml("<p>Hello world again</p>", plugin);
+
+    expect(durationsOf(result)).toEqual(["Hello=0", "world=0", "again=150"]);
+  });
+
+  it("ignores markdown syntax that appears or disappears around shown text", async () => {
+    const plugin = createAnimatePlugin();
+    await processHtml("<p>echo [foxtrot golf]</p>", plugin);
+    plugin.commit();
+
+    const result = await processHtml(
+      '<p>echo <a href="#">foxtrot golf</a> hotel</p>',
+      plugin
+    );
+
+    expect(durationsOf(result)).toEqual([
+      "echo=0",
+      "foxtrot=0",
+      "golf=0",
+      "hotel=150",
+    ]);
+  });
+
+  it("fades text that took the place of an image", async () => {
+    const plugin = createAnimatePlugin();
+    await processHtml('<p><img src="a.png"></p>', plugin);
+    plugin.commit();
+
+    const result = await processHtml("<p>![begonia]</p>", plugin);
+
+    expect(durationsOf(result)).toEqual(["![begonia]=150"]);
+  });
+
+  it("fades punctuation appended after unchanged text", async () => {
+    const plugin = createAnimatePlugin();
+    await processHtml("<p>Hello</p>", plugin);
+    plugin.commit();
+
+    const result = await processHtml("<p>Hello ...</p>", plugin);
+
+    expect(durationsOf(result)).toEqual(["Hello=0", "...=150"]);
+  });
+
+  it("keeps shown punctuation settled when nothing changed", async () => {
+    const plugin = createAnimatePlugin();
+    await processHtml("<p>Hello ...</p>", plugin);
+    plugin.commit();
+
+    const result = await processHtml("<p>Hello ...</p>", plugin);
+
+    expect(durationsOf(result)).toEqual(["Hello=0", "...=0"]);
+  });
+
+  it("keeps setPrevContentLength a plain character count", async () => {
+    const plugin = createAnimatePlugin();
+    plugin.setPrevContentLength(6);
+
+    const result = await processHtml("<p>Other words</p>", plugin);
+
+    expect(durationsOf(result)).toEqual(["Other=0", "words=150"]);
+  });
+});

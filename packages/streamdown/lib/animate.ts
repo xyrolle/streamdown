@@ -451,7 +451,13 @@ interface AnimateConfig {
 
 interface AnimateRenderState {
   committedCharCount: number;
+  /**
+   * The text `committedCharCount` counts (see `AnimateScan.text`), or null
+   * when the count was set by `setPrevContentLength` and the text is unknown.
+   */
+  committedText: string | null;
   lastRenderCharCount: number;
+  lastRenderText: string;
   /**
    * Timeline cursor snapshot from the first rehype run of the current commit.
    * null → not yet run this commit; number → rewind here on re-entry
@@ -472,17 +478,36 @@ const isNewAnimateUnit = (prevLen: number, partStart: number): boolean =>
 const isVoidAnimateElement = (node: Node): node is Element =>
   isElement(node) && VOID_ANIMATE_TAGS.has(node.tagName);
 
+// Stands in for an image or rule, which advances the char count by one.
+const VOID_ELEMENT_TEXT = "\uFFFC";
+
+// Whitespace and ASCII punctuation are what markdown syntax and layout are
+// made of, and streaming shows and hides them as constructs open and close:
+// `[text]` becomes a link once `(` arrives, a `| a |` line becomes a table
+// cell. They are left out when deciding whether text is still on screen.
+const LAYOUT_CHAR_RE = /[\s!-/:-@[-`{-~]/;
+const LAYOUT_CHARS_RE = /[\s!-/:-@[-`{-~]/g;
+
 /**
- * Count newly-animated units (mirrors processTextNode / processVoidElement
- * skip logic) so timeline.take reserves the right number of slots.
+ * What the char count runs over in a tree, read before any span is inserted.
+ * Mirrors processTextNode / processVoidElement.
  */
-const countNewWords = (
-  tree: Root,
-  config: AnimateConfig,
-  prevLen: number
-): number => {
-  let newWords = 0;
-  let charPos = 0;
+interface AnimateScan {
+  /** Char count of the whole tree. */
+  count: number;
+  /**
+   * Every counted text node and image/rule: where it starts in the char
+   * count and in `text`, how many characters it adds to `text`, its value.
+   */
+  pieces: { count: number; kept: number; text: number; value: string }[];
+  /** The counted text without layout characters (see LAYOUT_CHAR_RE). */
+  text: string;
+  /** Char count at which each animated unit starts, in order. */
+  units: number[];
+}
+
+const scanTree = (tree: Root, config: AnimateConfig): AnimateScan => {
+  const scan: AnimateScan = { count: 0, pieces: [], text: "", units: [] };
   visitParents(
     tree,
     (node: Node) => node.type === "text" || isVoidAnimateElement(node),
@@ -490,33 +515,110 @@ const countNewWords = (
       if (hasSkipAncestor(ancestors)) {
         return SKIP;
       }
-      if (isVoidAnimateElement(node)) {
-        if (isNewAnimateUnit(prevLen, charPos)) {
-          newWords += 1;
-        }
-        charPos += 1;
+      const isVoid = isVoidAnimateElement(node);
+      const value = isVoid ? VOID_ELEMENT_TEXT : (node as Text).value;
+      const kept = value.replace(LAYOUT_CHARS_RE, "");
+      scan.pieces.push({
+        count: scan.count,
+        kept: kept.length,
+        text: scan.text.length,
+        value,
+      });
+      scan.text += kept;
+      if (isVoid) {
+        scan.units.push(scan.count);
+        scan.count += 1;
         return;
       }
-      const text = (node as Text).value;
-      if (!text.trim()) {
-        charPos += text.length;
+      if (!value.trim()) {
+        scan.count += value.length;
         return;
       }
       const parts =
-        config.sep === "char" ? splitByChar(text) : splitByWord(text);
+        config.sep === "char" ? splitByChar(value) : splitByWord(value);
       for (const part of parts) {
-        const partStart = charPos;
-        charPos += part.length;
-        if (
-          !WHITESPACE_ONLY_RE.test(part) &&
-          isNewAnimateUnit(prevLen, partStart)
-        ) {
-          newWords += 1;
+        if (!WHITESPACE_ONLY_RE.test(part)) {
+          scan.units.push(scan.count);
         }
+        scan.count += part.length;
       }
     }
   );
-  return newWords;
+  return scan;
+};
+
+/** Char count right after the last character of `scan.text`. */
+const getTextEndCharCount = (scan: AnimateScan): number => {
+  for (let index = scan.pieces.length - 1; index >= 0; index -= 1) {
+    const { count, kept, value } = scan.pieces[index];
+    if (kept > 0) {
+      let offset = value.length;
+      while (LAYOUT_CHAR_RE.test(value[offset - 1])) {
+        offset -= 1;
+      }
+      return count + offset;
+    }
+  }
+  return 0;
+};
+
+/**
+ * Char count up to which the scanned tree still shows the text `committed`
+ * showed. Text after that point replaced what was there, so it is new.
+ */
+const getUnchangedCharCount = (
+  committed: string,
+  committedCharCount: number,
+  scan: AnimateScan
+): number => {
+  const length = Math.min(committed.length, scan.text.length);
+  let shared = 0;
+  while (shared < length && committed[shared] === scan.text[shared]) {
+    shared += 1;
+  }
+  if (shared === scan.text.length) {
+    // Nothing changed but layout, which may have moved the text: everything
+    // up to its last character was on screen, and so was what the old count
+    // covered.
+    return Math.max(committedCharCount, getTextEndCharCount(scan));
+  }
+  // Find the first character that differs in the piece it belongs to.
+  let index = scan.pieces.findIndex(
+    (piece) => piece.text <= shared && shared < piece.text + piece.kept
+  );
+  const { text, value } = scan.pieces[index];
+  let kept = text;
+  let offset = 0;
+  while (kept < shared || LAYOUT_CHAR_RE.test(value[offset])) {
+    if (!LAYOUT_CHAR_RE.test(value[offset])) {
+      kept += 1;
+    }
+    offset += 1;
+  }
+  // Syntax right before it changed with it: the `![` of an `![alt]` that
+  // used to be an image.
+  while (index > 0 || offset > 0) {
+    if (offset === 0) {
+      index -= 1;
+      offset = scan.pieces[index].value.length;
+    } else if (LAYOUT_CHAR_RE.test(scan.pieces[index].value[offset - 1])) {
+      offset -= 1;
+    } else {
+      break;
+    }
+  }
+  return scan.pieces[index].count + offset;
+};
+
+/** Units to animate, so timeline.take reserves the right number of slots. */
+const countNewUnits = (units: number[], prevLen: number): number => {
+  let newUnits = 0;
+  for (const start of units) {
+    if (isNewAnimateUnit(prevLen, start)) {
+      newUnits += 1;
+    }
+  }
+  return newUnits;
 };
 
 const processTextNode = (
@@ -631,17 +733,29 @@ function buildAnimatePlugin(
 
   const renderState: AnimateRenderState = {
     committedCharCount: 0,
+    committedText: "",
     prevContentLength: 0,
     lastRenderCharCount: 0,
+    lastRenderText: "",
     pendingMark: null,
   };
 
   const id = instanceId++;
   const rehypeAnimate = () => (tree: Root) => {
     const charCounter = { count: 0, newIndex: 0 };
+    const scan = scanTree(tree, config);
 
-    // Seed skip-window from the last committed paint (#570 secondary).
-    renderState.prevContentLength = renderState.committedCharCount;
+    // Seed skip-window from the last committed paint (#570 secondary). Only
+    // the part of that text this render still starts with is on screen
+    // already: text that replaced it has to fade in like any new text.
+    renderState.prevContentLength =
+      renderState.committedText === null
+        ? renderState.committedCharCount
+        : getUnchangedCharCount(
+            renderState.committedText,
+            renderState.committedCharCount,
+            scan
+          );
 
     const timeline = config.timeline;
     const now = timeline?.now() ?? defaultNow();
@@ -658,7 +772,7 @@ function buildAnimatePlugin(
 
     const schedule: Schedule = timeline
       ? timeline.take(
-          countNewWords(tree, config, renderState.prevContentLength),
+          countNewUnits(scan.units, renderState.prevContentLength),
           config.stagger,
           now
         )
@@ -689,6 +803,7 @@ function buildAnimatePlugin(
       }
     );
     renderState.lastRenderCharCount = charCounter.count;
+    renderState.lastRenderText = scan.text;
     renderState.prevContentLength = 0;
   };
 
@@ -702,6 +817,7 @@ function buildAnimatePlugin(
     rehypePlugin: rehypeAnimate,
     setPrevContentLength(length: number) {
       renderState.committedCharCount = length;
+      renderState.committedText = null;
       renderState.prevContentLength = length;
     },
     getLastRenderCharCount() {
@@ -709,6 +825,7 @@ function buildAnimatePlugin(
     },
     commit() {
       renderState.committedCharCount = renderState.lastRenderCharCount;
+      renderState.committedText = renderState.lastRenderText;
       renderState.pendingMark = null;
     },
   };
